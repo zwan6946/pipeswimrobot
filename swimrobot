@@ -1,0 +1,324 @@
+#include <Servo.h>
+#include <CurieIMU.h>
+#include <MadgwickAHRS.h>
+#include <MechaQMC5883.h>
+#include <SD.h>
+#include <SPI.h>
+
+
+
+#define log_time 40 //s
+#define sample_rate 100 // Hz, not ms.As Paul's
+//initial setting, filter runs at 20 Hz (or 25 Hz).(IMU may not have a 20 Hz option.) 25 50 100 200 400 800 1600
+#define AccelerometerRange 2 //
+#define GyroRange 2000
+#define qmc_odr ODR_100Hz // 10 50 100 200
+#define sample_rate 100
+i
+float convertRawAcceleration(int aRaw);
+float convertRawGyro(int gRaw);
+void savedata(float ax, float ay, float az, float gx, float gy, float gz, float yaw, float pitch, float roll) ;
+void SDcardSetup();
+void ServoSetup();
+void IMUSetup();
+
+
+const int button = 6;
+const int LED2 = 10;
+unsigned long time_1;
+unsigned long time_2;
+
+const int LED1 = 9;
+int buttonState = 0;
+
+int analogPin;
+int sensor;
+//int led = 13;
+float scale_ax = 2.01; // This should be obtained from manul calibration (try to get the max and min reading of gravity).
+float scale_ay = 2.008;
+float scale_az = 2.093;
+
+String dataString = ""; //for transforing data to sd card
+int i = 0;
+
+// sd card setting
+File myFile;
+const int chipSelect = 8;//select chip
+
+
+Madgwick filter; // Configue the 'beta' in the MadgwickAHRS.cpp
+MechaQMC5883 qmc;
+
+unsigned long microsPerReading, microsPrevious, microsNow,microsBegin;
+float SamplePeriod, TimeNow;
+int aix, aiy, aiz;
+int gix, giy, giz;
+float ax, ay, az;
+float gx, gy, gz;
+double yaw;
+double pitch;
+double roll;
+
+
+//int factor = 800; // variable by which to divide gyroscope values, used to control sensitivity. Note that an increased baud rate requires an increase in value of factor
+
+int calibrateOffsets = 1; // int to determine whether calibration takes place or not
+
+
+byte servoPin = 7;
+Servo servo;
+int Servosignal = 1400;  // Set signal value, which should be between 1100 and 1900(1500 is stope sign)
+
+void setup() {
+  dataString = "";
+  pinMode(LED2, OUTPUT);
+  pinMode(LED1, OUTPUT);
+  pinMode(button, INPUT);
+  Serial.begin(9600);
+  Serial.println("begin set up");
+    SDcardSetup();
+    ServoSetup();
+    IMUSetup();
+  Serial.println("done set up");
+}
+
+void loop() {
+   
+  if (i == 0){
+    digitalWrite(LED1,HIGH);
+    digitalWrite(LED2,HIGH);
+    delay(3000); // wait for 3s
+    digitalWrite(LED1,LOW);
+    digitalWrite(LED2,LOW);
+    time_1 = millis();
+    microsBegin = micros();
+    }
+  i++;
+  digitalWrite(LED1,HIGH);
+  servo.writeMicroseconds(Servosignal);  // Send signal to ESC.
+  Serial.print("start loop : "); Serial.println(i);
+  int a;
+  String name = "";
+  // writing data into SD card file every 10 groups
+  a = i % 10; 
+  Serial.print("a is : "); Serial.println(a);
+  if (a == 0) {
+    digitalWrite(LED1,LOW);
+    Serial.flush();
+    name = String(i) + ".txt";
+    Serial.println(name);
+    Serial.flush();
+    myFile = SD.open( name, FILE_WRITE);
+    // if the file opened okay, write to it:
+    if (myFile) {
+      Serial.print("Writing to test.txt...");
+      myFile.print(dataString);
+      // close the file:
+      myFile.flush();
+      myFile.close();
+      Serial.println("done.");
+      digitalWrite(LED2, HIGH);
+    } else {
+      // if the file didn't open, print an error:
+      Serial.println("error opening test.txt");
+      digitalWrite(LED2, LOW);
+      time_2 = millis();
+      Serial.print("running time is : ");
+      Serial.println((time_2-time_1)/1000);
+      while(1){
+        ; // 
+        }
+    }
+//     re-open the file for reading:
+    myFile = SD.open(name);
+    if (myFile) {
+      Serial.println("test.txt:");
+      // read from the file until there's nothing else in it:
+      while (myFile.available()) {
+        Serial.write(myFile.read());
+      }
+      // close the file:
+      myFile.close();
+    } else {
+      // if the file didn't open, print an error:
+      Serial.println("error opening test.txt");
+    }
+
+    dataString = "";
+  }
+
+  // check if it's time to read data and update the filter
+  microsNow = micros() - microsBegin;
+  Serial.println(microsNow/1000.0);
+  if (microsNow - microsPrevious >= microsPerReading) {
+    Serial.println("A");
+    TimeNow = microsNow / 1000.0;
+    dataString += String(i); // The 1st column of test.TXT
+    dataString += ' ';
+    dataString += String(TimeNow); // The 2nd column of test.TXT. Time in (ms).
+    dataString += ' ';
+    // read sensor and append to the string: v                                
+    analogPin = 0;
+    sensor = analogRead(analogPin); // analogRead(): Reads the value from the specified analog pin. It returns a int (0 to 1023).
+
+    if (sensor < 200) {
+      Serial.println("checking the microphone connection OUT pin to analogPin_0");
+    }
+
+    dataString += String(sensor); //The 3rd column of test.TXT It is a (0-1023) Analog Read from Pin_0.
+
+    // read raw accel/gyro measurements from device
+    CurieIMU.readMotionSensor(aix, aiy, aiz, gix, giy, giz);
+    Serial.println("C");
+    // convert from raw data to gravity and degrees/second units -->>> See 'Function Definitions' at the End of the Code
+    ax = convertRawAcceleration(aix, scale_ax);
+    ay = convertRawAcceleration(aiy, scale_ay);
+    az = convertRawAcceleration(aiz, scale_az);
+    gx = convertRawGyro(gix);   // gx corresponds to roll -->> Angular Velocity -->> wx
+    gy = convertRawGyro(giy);   // gy corresponds to pitch
+    gz = convertRawGyro(giz);   // gz corresponds to yaw
+    Serial.flush();
+    Serial.println("HERE");
+    // use function from MagdwickAHRS.h to return quaternions
+    Serial.flush();
+    filter.updateIMU(gx, gy, gz, ax, ay, az); // filter is using converted(offseted and then scaled) data as input. check cpp file: 6 or 9 arguments both are okay.
+    Serial.flush();
+    //update() for 9 arguments; updateIMU() for 6 arguments.
+    // functions to find yaw, roll and pitch from quaternions
+    roll = filter.getRoll();
+    pitch = filter.getPitch();
+    yaw = filter.getYaw();
+    Serial.flush();
+    //    delay(40);   //the delay to avoid break up // HERE IS A DELAY !!!!
+    //Save the data to dataString ->> a temp String variable
+    savedata(ax, ay, az, gx, gy, gz, yaw, pitch, roll);// The sequence is : Yaw, Pitch, Roll !!
+    Serial.println("D");
+    microsPrevious = microsNow;
+  }
+}
+
+
+//---------------------------Functions----------------------------//
+
+void SDcardSetup(){
+  // sd card set up
+  Serial.print("initializing SD card..");
+  if (!SD.begin(chipSelect)) {
+    Serial.println("failed");
+    digitalWrite(LED1, HIGH);
+    return;
+  }
+  Serial.println("card intialized");
+  }
+  
+void ServoSetup(){
+  servo.attach(servoPin);
+  servo.writeMicroseconds(1500); // send "stop" signal to ESC.
+  delay(3000); // delay to allow the ESC to recognize the stopped signal
+  }
+
+float convertRawAcceleration(int aRaw, float scale) {    // A Simple Range Mapping // !!!! this part may  also be moved to offline program. !!!
+  // since we are using 2G range
+  // -2g maps to a raw value of -32768
+  // +2g maps to a raw value of 32767
+
+  float a = (aRaw * 2.0 * 2.0 / scale) / 32768.0;
+  return a;
+}
+
+float convertRawGyro(int gRaw) {
+  // since we are using 250 degrees/seconds range
+  // -250 maps to a raw value of -32768
+  // +250 maps to a raw value of 32767
+
+  float g = (gRaw * 2000.0) / 32768.0;
+  return g;
+}
+
+void savedata(float ax, float ay, float az, float gx, float gy, float gz, float yaw, float pitch, float roll) {
+
+  dataString += ' ';
+  dataString += String(ax);
+  dataString += ' ';
+  dataString += String(ay);
+  dataString += ' ';
+  dataString += String(az);
+  dataString += ' ';
+  dataString += String(gx);
+  dataString += ' ';
+  dataString += String(gy);
+  dataString += ' ';
+  dataString += String(gz);
+  dataString += ' ';
+  dataString += String(yaw);// Here is a very fatal and naive mistake, write the order as: roll, yaw, pitch, OMG!!!!!!!!!!
+  dataString += ' ';
+  dataString += String(pitch);
+  dataString += ' ';
+  dataString += String(roll);
+  dataString += '\n';
+
+}
+
+void IMUSetup() {
+  CurieIMU.begin();
+  if (calibrateOffsets == 1) {
+    // use the code below to calibrate accel/gyro offset values
+
+    Serial.println("Internal sensor offsets BEFORE calibration...");
+    Serial.print("Accelerometer:\n");
+    Serial.print(CurieIMU.getAccelerometerOffset(X_AXIS)); Serial.print("\t");//The value of the offset for the selected axis. The value returned varies from -495.3 mg to + 495.3 mg in discrete steps of 3.9mg.
+    Serial.print(CurieIMU.getAccelerometerOffset(Y_AXIS)); Serial.print("\t");
+    Serial.print(CurieIMU.getAccelerometerOffset(Z_AXIS)); Serial.print("\t\n");
+    Serial.print("Gyroscope:\n");
+    Serial.print(CurieIMU.getGyroOffset(X_AXIS)); Serial.print("\t");//The value of the offset for the selected axis. The returned value is from -31.25 鎺�/s to +31.25 鎺�/s in discrete steps of 0.061 鎺�/s.
+    Serial.print(CurieIMU.getGyroOffset(Y_AXIS)); Serial.print("\t");
+    Serial.print(CurieIMU.getGyroOffset(Z_AXIS)); Serial.print("\t");
+    Serial.println("");
+
+    // To manually configure offset compensation values, use the following methods instead of the autoCalibrate...() methods below
+    CurieIMU.setGyroOffset(X_AXIS, 0.31);
+    CurieIMU.setGyroOffset(Y_AXIS, -0.67);
+    CurieIMU.setGyroOffset(Z_AXIS, 0);
+
+    // CurieIMU.noAccelerometerOffset(); // 娴奸棿绠瓹urieIMU.h闁插苯鑻熷▽鈩冩箒鐠囪褰� BMI160 閻拷 Non-Volatile Memory 閻ㄥ嫭婧�閸掕翰锟斤拷
+    CurieIMU.setAccelerometerOffset(X_AXIS, 17.1); //閻╁瓨甯撮悽鈺痚rial port缁嬪绨幗绋垮煂鐎瑰啫鎮囨潪鏉戭嚠gravity閻ㄥ埓ax閸滃in閿涘本宓佸銈堫吀缁犳鍤璵anucali閻ㄥ墕cale閸滃ffset.
+    CurieIMU.setAccelerometerOffset(Y_AXIS, 104);
+    CurieIMU.setAccelerometerOffset(Z_AXIS, -99);
+
+
+    // The stupid autoCalibration has been disabled.
+    // IMU device must be resting in a HORIZONTAL POSITION for the following calibration procedure to work correctly.
+
+    Serial.print("Starting Gyroscope calibration...");
+    CurieIMU.autoCalibrateGyroOffset();   // CHECK <CurieIMU.cpp> and <BMI160.cpp> ->> BMI160 datasheet: 'Fast Offset Compensation'. Stupid FOC !
+    //Starts an autocalibration of the gyro's offset. During this procedure the board should stay MOTIONLESS. When finished, this procedure writes the proper offset value in the IMU register that can be read with getGyroOffset.
+    Serial.println(" Done");//閺佺増宓佺拠浣规gyro閻ㄥ垻ali娑旂喐妲竨nnecessary.
+
+
+    Serial.println("Internal sensor offsets AFTER calibration...");
+    Serial.print("Accelerometer:\n");
+    Serial.print(CurieIMU.getAccelerometerOffset(X_AXIS)); Serial.print("\t");
+    Serial.print(CurieIMU.getAccelerometerOffset(Y_AXIS)); Serial.print("\t");
+    Serial.print(CurieIMU.getAccelerometerOffset(Z_AXIS)); Serial.print("\t\n");
+    Serial.print("Gyroscope:\n");
+    Serial.print(CurieIMU.getGyroOffset(X_AXIS)); Serial.print("\t");
+    Serial.print(CurieIMU.getGyroOffset(Y_AXIS)); Serial.print("\t");
+    Serial.print(CurieIMU.getGyroOffset(Z_AXIS)); Serial.print("\t");
+    Serial.println("");
+
+  }
+  // start the IMU and filter
+  CurieIMU.setGyroRate(sample_rate);
+  CurieIMU.setAccelerometerRate(sample_rate);
+  filter.begin(sample_rate);
+
+  // Set the accelerometer range to 8G
+  CurieIMU.setAccelerometerRange(AccelerometerRange);// 8g is too large. Now it's 4g.
+  // Set the gyroscope range to 3000 degrees/second .Is there really a 3000 option?? Now it's 2000.
+  CurieIMU.setGyroRange(GyroRange);
+
+  // initialize variables to pace updates to correct rate
+  microsPerReading = 1000 / sample_rate; // CONST
+  microsPrevious = millis(); //millis(): Returns the number of (ms) since the Arduino board began running the current program. This number will overflow (go back to zero), after approximately 50 days.
+}
+
